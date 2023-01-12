@@ -38,6 +38,8 @@ type Tab struct {
 	Url                  string          `json:"url"`
 	WebSocketDebuggerUrl string          `json:"webSocketDebuggerUrl"`
 	WsConn               *websocket.Conn `json:"-"`
+	ReqID                int
+	Lock                 *sync.Mutex
 }
 
 func decode(resp *http.Response, v interface{}) error {
@@ -247,8 +249,23 @@ func (err EvaluateError) Error() string {
 	return desc
 }
 
-func (t *Tab) SendRequest(command string, params Params) (map[string]interface{}, error) {
+func (t *Tab) SendRequest(method string, params Params) (map[string]interface{}, error) {
+	responseChan := make(chan json.RawMessage, 1)
+	reqID := t.reqID
+	t.Lock.Lock()
+	t.responses[reqID] = responseChan
+	t.reqID++
+	t.Lock.Unlock()
 
+	command := Params{
+		"id":     reqID,
+		"method": method,
+		"params": params,
+	}
+
+	remote.requests <- command
+	reply := <-responseChan
+	return unmarshal(rawReply)
 }
 
 func (t *Tab) Evalate(expr string) (interface{}, error) {
