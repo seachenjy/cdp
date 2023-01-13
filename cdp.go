@@ -2,7 +2,9 @@ package cdp
 
 // 接管chrome调试模式，多tab执行调试任务
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,20 +15,25 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+var (
+	ErrorOpenRemoteURL   = errors.New("ErrorOpenRemoteURL 调试地址访问失败")
+	ErrorTabWsDisconnect = errors.New("ErrorTabWsDisconnect websocket连接已经断开")
+	ErrorTimeout         = errors.New("ErrorTimeout 超时")
+)
+
 type RemoteClient struct {
 	RemoteUrl  *url.URL //调试地址
 	Client     *http.Client
-	TabSize    int //最多允许打开的tab标签数量
-	Tabs       []*Tab
+	TabSize    int    //最多允许打开的tab标签数量
+	Tabs       []*Tab //tab池
 	TabChan    chan *Tab
 	TabCallers []TabCaller
 	Lock       *sync.Mutex
 }
 
-type TabCaller func(tab *Tab) *Tab
-
-// 单例
-var connected = false
+// tab执行器
+// 返回tab指针，会回收进tab池
+type TabCaller func(tab *Tab)
 
 // tab标签
 type Tab struct {
@@ -34,18 +41,28 @@ type Tab struct {
 	DevtoolsFrontendUrl  string          `json:"devtoolsFrontendUrl"`
 	ID                   string          `json:"id"`
 	Title                string          `json:"title"`
-	Type                 string          `json:"string"`
+	Type                 string          `json:"type"`
 	Url                  string          `json:"url"`
 	WebSocketDebuggerUrl string          `json:"webSocketDebuggerUrl"`
 	WsConn               *websocket.Conn `json:"-"`
 	ReqID                int
 	Lock                 *sync.Mutex
+	ResponseCall         map[int]wsResponseCall
+}
+
+type wsResponseCall func(message wsMessage)
+
+type wsMessage struct {
+	ID     int             `json:"id"`
+	Result json.RawMessage `json:"result"`
+
+	Method string          `json:"Method"`
+	Params json.RawMessage `json:"Params"`
 }
 
 func decode(resp *http.Response, v interface{}) error {
 	err := json.NewDecoder(resp.Body).Decode(v)
 	resp.Body.Close()
-
 	return err
 }
 
@@ -66,8 +83,7 @@ func (c *RemoteClient) GetRequest(method, path string) (*http.Request, error) {
 	return http.NewRequest(method, url.String(), nil)
 }
 
-// 初始化，单例
-func New(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
+func Init(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 	var client RemoteClient
 	u, err := url.Parse(remoteUrl)
 	if err != nil {
@@ -82,11 +98,11 @@ func New(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 	client.TabSize = maxTabSize
 	client.Lock = &sync.Mutex{}
 	client.TabChan = make(chan *Tab)
-	connected = true
 	tabs, err := client.TabList("page")
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println("tab length:", len(tabs))
 	for i := 0; i < maxTabSize-len(tabs); i++ {
 		tab, err := client.NewTab("")
 		if err != nil {
@@ -99,15 +115,43 @@ func New(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 	return &client, nil
 }
 
+// 初始化tab,建立ws侦听轮询
+func (tab *Tab) Init() error {
+	conn, _, err := websocket.DefaultDialer.Dial(tab.WebSocketDebuggerUrl, nil)
+	if err != nil {
+		return err
+	}
+	tab.Lock = &sync.Mutex{}
+	tab.WsConn = conn
+	tab.ResponseCall = make(map[int]wsResponseCall)
+	go tab.WsLoop()
+	return nil
+}
+
+func (tab *Tab) WsLoop() {
+	for {
+		var message wsMessage
+		err := tab.WsConn.ReadJSON(&message)
+		if err != nil {
+			continue
+		}
+		caller, ok := tab.ResponseCall[message.ID]
+		if ok {
+			caller(message)
+		}
+	}
+}
+
 func (c *RemoteClient) Run() {
 	for {
 		t := <-c.TabChan
 		c.Lock.Lock()
 		if len(c.TabCallers) > 0 {
 			caller := c.TabCallers[0]
-			go func() {
-				c.TabChan <- caller(t)
-			}()
+			go func(t *Tab) {
+				caller(t)
+				c.TabChan <- t
+			}(t)
 			c.TabCallers = c.TabCallers[1:]
 		} else {
 			c.Tabs = append(c.Tabs, t)
@@ -116,14 +160,32 @@ func (c *RemoteClient) Run() {
 	}
 }
 
+func (c *RemoteClient) Reset(t *Tab) {
+	t.WsConn.Close()
+	c.CloseTab(t)
+	tab, err := c.NewTab("")
+	if err != nil {
+		fmt.Println(err)
+	}
+	c.TabChan <- tab
+}
+
 // 添加一个执行任务
 func (c *RemoteClient) Do(caller TabCaller) {
 	c.Lock.Lock()
 	if len(c.Tabs) > 0 {
 		tab := c.Tabs[0]
-		go func() {
-			c.TabChan <- caller(tab)
-		}()
+		if tab.WsConn == nil {
+			err := tab.Init()
+			if err != nil {
+				c.TabCallers = append(c.TabCallers, caller)
+				go c.Reset(tab)
+			}
+		}
+		go func(tab *Tab) {
+			caller(tab)
+			c.TabChan <- tab
+		}(tab)
 		c.Tabs = c.Tabs[1:]
 	} else {
 		c.TabCallers = append(c.TabCallers, caller)
@@ -142,13 +204,14 @@ func (c *RemoteClient) NewTab(url string) (*Tab, error) {
 	}
 	resp, err := c.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, ErrorOpenRemoteURL
 	}
 
 	var tab Tab
 	if err = decode(resp, &tab); err != nil {
 		return nil, err
 	}
+
 	return &tab, nil
 }
 
@@ -160,7 +223,7 @@ func (c *RemoteClient) CloseTab(t *Tab) error {
 	}
 	_, err = c.Client.Do(req)
 	if err != nil {
-		return err
+		return ErrorOpenRemoteURL
 	}
 	return nil
 }
@@ -172,7 +235,7 @@ func (c *RemoteClient) TabList(filter string) ([]*Tab, error) {
 	}
 	resp, err := c.Client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, ErrorOpenRemoteURL
 	}
 
 	var tabs []*Tab
@@ -196,7 +259,7 @@ func (c *RemoteClient) TabList(filter string) ([]*Tab, error) {
 	return filtered, nil
 }
 
-func getWs(t *Tab) (*websocket.Conn, error) {
+func GetWs(t *Tab) (*websocket.Conn, error) {
 	if t.WsConn == nil {
 		d := &websocket.Dialer{}
 
@@ -249,46 +312,64 @@ func (err EvaluateError) Error() string {
 	return desc
 }
 
-func (t *Tab) SendRequest(method string, params Params) (map[string]interface{}, error) {
-	responseChan := make(chan json.RawMessage, 1)
-	reqID := t.reqID
+func (t *Tab) SendRequest(method string, params Params, caller wsResponseCall) error {
 	t.Lock.Lock()
-	t.responses[reqID] = responseChan
-	t.reqID++
-	t.Lock.Unlock()
-
+	t.ReqID++
+	if caller != nil {
+		t.ResponseCall[t.ReqID] = caller
+	}
 	command := Params{
-		"id":     reqID,
+		"id":     t.ReqID,
 		"method": method,
 		"params": params,
 	}
+	t.Lock.Unlock()
 
-	remote.requests <- command
-	reply := <-responseChan
-	return unmarshal(rawReply)
+	return t.WsConn.WriteJSON(command)
 }
 
-func (t *Tab) Evalate(expr string) (interface{}, error) {
+func (t *Tab) Evalate(expr string, timeout time.Duration) (interface{}, error) {
 	params := Params{
 		"expression":    expr,
 		"returnByValue": true,
 	}
+	resch := make(chan interface{})
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	err := t.SendRequest("Runtime.evaluate", params, func(res wsMessage) {
 
-	res, err := t.SendRequest("Runtime.evaluate", params)
+		result, err := unmarshal(res.Result)
+
+		if err != nil {
+			fmt.Println(err)
+			cancel()
+		}
+		if subtype, ok := result["subtype"]; ok && subtype.(string) == "error" {
+			fmt.Println(err)
+			cancel()
+		}
+		if res, ok := result["result"]; ok {
+			value, ok := res.(map[string]interface{})["value"].(string)
+			if ok {
+				resch <- value
+			} else {
+				cancel()
+			}
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if res == nil {
-		return nil, nil
+	select {
+	case res := <-resch:
+		return res, nil
+	case <-ctx.Done():
+		return nil, ErrorTimeout
 	}
+}
 
-	result := res["result"].(map[string]interface{})
-	if subtype, ok := result["subtype"]; ok && subtype.(string) == "error" {
-		// this is actually an error
-		exception := res["exceptionDetails"].(map[string]interface{})
-		return nil, EvaluateError{ErrorDetails: result, ExceptionDetails: exception}
-	}
-
-	return result["value"], nil
+func (t *Tab) Navigate(url string) error {
+	return t.SendRequest("Page.navigate", Params{
+		"url": url,
+	}, nil)
 }
