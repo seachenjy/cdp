@@ -3,6 +3,7 @@ package cdp
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestError(t *testing.T) {
@@ -25,6 +26,7 @@ func TestError(t *testing.T) {
 		go func(u string, w *sync.WaitGroup) {
 			client.Do(func(tab *Tab) {
 				tab.Navigate(u)
+				tab.WaitPageComplete(time.Second * 5)
 				title, err := tab.Evaluate("document.title")
 				if err != nil {
 					t.Error(err)
