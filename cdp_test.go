@@ -1,10 +1,8 @@
 package cdp
 
 import (
-	"fmt"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestError(t *testing.T) {
@@ -13,26 +11,29 @@ func TestError(t *testing.T) {
 		t.Error(err)
 	}
 	urls := []string{
-		"http://www.baidu.com",
-		"http://www.163.com",
 		"http://www.qq.com",
 		"http://www.tencent.com",
 		"http://www.sina.com",
 		"http://www.jandan.net",
 		"http://www.weixin.com",
+		"http://www.163.com",
+		"http://www.taobao.com",
 	}
 	wait := &sync.WaitGroup{}
 	for _, url := range urls {
 		wait.Add(1)
-		go func(url string, wait *sync.WaitGroup) {
+		go func(u string, w *sync.WaitGroup) {
 			client.Do(func(tab *Tab) {
-				tab.Navigate(url)
-				time.Sleep(5 * time.Second)
-				title, err := tab.Evalate("document.title", time.Second*5)
-				fmt.Println(title, err, url)
-				wait.Done()
+				tab.Navigate(u)
+				title, err := tab.Evaluate("document.title")
+				if err != nil {
+					t.Error(err)
+				}
+				w.Done()
+				t.Log(title, u)
 			})
 		}(url, wait)
 	}
+
 	wait.Wait()
 }
