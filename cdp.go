@@ -258,9 +258,7 @@ func (tab *Tab) Init() error {
 
 func (tab *Tab) WsLoop() {
 	for {
-
 		var message wsMessage
-
 		err := tab.wsConn.ReadJSON(&message)
 		if err != nil {
 			continue
@@ -268,7 +266,7 @@ func (tab *Tab) WsLoop() {
 			callback, ok := tab.callbacks[message.Method]
 			if ok {
 				params, err := unmarshal(message.Params)
-				if err != nil {
+				if err == nil {
 					callback(params)
 				}
 			}
@@ -400,6 +398,7 @@ func (t *Tab) SendRequest(method string, params Params) (map[string]interface{},
 func (t *Tab) sendRawReplyRequest(method string, params Params) ([]byte, error) {
 
 	t.lock.Lock()
+
 	responseChan := make(chan json.RawMessage, 1)
 	reqID := t.reqID
 	t.responses[reqID] = responseChan
@@ -411,11 +410,12 @@ func (t *Tab) sendRawReplyRequest(method string, params Params) ([]byte, error) 
 		"method": method,
 		"params": params,
 	}
-
-	t.wsConn.WriteJSON(command)
+	err := t.wsConn.WriteJSON(command)
+	if err != nil {
+		return nil, err
+	}
 
 	reply := <-responseChan
-
 	close(responseChan)
 	t.lock.Lock()
 	delete(t.responses, reqID)
@@ -428,7 +428,6 @@ func (t *Tab) GetResponseBody(requestId string) ([]byte, error) {
 	res, err := t.SendRequest("Network.getResponseBody", Params{
 		"requestId": requestId,
 	})
-
 	if err != nil {
 		return nil, err
 	}

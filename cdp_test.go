@@ -39,3 +39,37 @@ func TestError(t *testing.T) {
 
 	wait.Wait()
 }
+
+func TestResponseBody(t *testing.T) {
+	client, err := Init("http://localhost:9222", 1)
+	if err != nil {
+		t.Error(err)
+	}
+	url := "https://www.wolai.com/downloads"
+	client.Do(func(tab *Tab) {
+		reqid := make(chan string)
+		tab.CallbackEvent("Network.responseReceived", func(params Params) {
+			response := params["response"].(map[string]interface{})
+			if response["mimeType"].(string) == "application/json" {
+				requestid := params["requestId"].(string)
+				reqid <- requestid
+			}
+		})
+		tab.NetworkEvents(true)
+		tab.Navigate(url)
+		for {
+			select {
+			case id := <-reqid:
+				bytes, err := tab.GetResponseBody(id)
+				if err == nil {
+					t.Log(string(bytes))
+				} else {
+					t.Error(err)
+				}
+			case <-time.After(time.Second * 10):
+				return
+			}
+		}
+	})
+	time.Sleep(30 * time.Second)
+}
