@@ -15,54 +15,56 @@ import (
 )
 
 var (
-	ErrorOpenRemoteURL   = errors.New("ErrorOpenRemoteURL 调试地址访问失败")
-	ErrorTabWsDisconnect = errors.New("ErrorTabWsDisconnect websocket连接已经断开")
-	ErrorTimeout         = errors.New("ErrorTimeout 超时")
+	ErrorOpenRemoteURL   = errors.New("调试地址访问失败")
+	ErrorTabWsDisconnect = errors.New("websocket连接已经断开")
+	ErrorTimeout         = errors.New("超时")
 )
-
-// tab执行器
-// 返回tab指针，会回收进tab池
-type TabCaller func(tab *Tab)
-type Params map[string]interface{}
-
-// tab标签
-type Tab struct {
-	Description          string          `json:"description"`
-	DevtoolsFrontendUrl  string          `json:"devtoolsFrontendUrl"`
-	ID                   string          `json:"id"`
-	Title                string          `json:"title"`
-	Type                 string          `json:"type"`
-	Url                  string          `json:"url"`
-	WebSocketDebuggerUrl string          `json:"webSocketDebuggerUrl"`
-	wsConn               *websocket.Conn `json:"-"`
-	reqID                int
-	lock                 *sync.Mutex
-	responses            map[int]chan json.RawMessage
-	callbacks            map[string]EventCallback
-}
-type EventCallback func(params Params)
 
 // ws消息体
 type wsMessage struct {
 	ID     int             `json:"id"`
 	Result json.RawMessage `json:"result"`
-
 	Method string          `json:"Method"`
 	Params json.RawMessage `json:"Params"`
 }
 
 type RemoteClient struct {
-	RemoteUrl   *url.URL //调试地址
-	Client      *http.Client
-	TabSize     int    //最多允许打开的tab标签数量
-	Tabs        []*Tab //tab池
-	TabChan     chan *Tab
-	TabCallChan chan TabCaller
-	TabCallers  []TabCaller
-	lock        *sync.Mutex
+	RemoteUrl  *url.URL     //调试地址
+	Client     *http.Client //http client for brower
+	TabSize    int          //最多允许打开的tab标签数量
+	Tabs       []*Tab       //tab池
+	TabChan    chan *Tab    //tab chan
+	TabCallers []TabCaller  //标签调用集合
+	lock       *sync.Mutex  //lock
 }
 
-func (c *RemoteClient) GetRequest(method, path string) (*http.Request, error) {
+// 标签调用方法
+type TabCaller func(tab *Tab)
+
+// params
+type Params map[string]interface{}
+
+// 事件回调
+type EventCallback func(params Params)
+
+// tab标签
+type Tab struct {
+	Description          string                       `json:"description"`
+	DevtoolsFrontendUrl  string                       `json:"devtoolsFrontendUrl"`
+	ID                   string                       `json:"id"`
+	Title                string                       `json:"title"`
+	Type                 string                       `json:"type"`
+	Url                  string                       `json:"url"`
+	WebSocketDebuggerUrl string                       `json:"webSocketDebuggerUrl"`
+	BorwserClient        *RemoteClient                `json:"-"`
+	wsConn               *websocket.Conn              `json:"-"`
+	reqID                int                          `json:"-"`
+	lock                 *sync.Mutex                  `json:"-"`
+	responses            map[int]chan json.RawMessage `json:"-"`
+	eventCallBacks       map[string]EventCallback     `json:"-"`
+}
+
+func (c *RemoteClient) getRequest(method, path string) (*http.Request, error) {
 	url, err := c.RemoteUrl.Parse(path)
 	if err != nil {
 		return nil, err
@@ -70,7 +72,8 @@ func (c *RemoteClient) GetRequest(method, path string) (*http.Request, error) {
 	return http.NewRequest(method, url.String(), nil)
 }
 
-func Init(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
+// NewBrower 创建一个浏览器
+func NewBrower(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 	var client RemoteClient
 	u, err := url.Parse(remoteUrl)
 	if err != nil {
@@ -85,12 +88,19 @@ func Init(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 	client.TabSize = maxTabSize
 	client.lock = &sync.Mutex{}
 	client.TabChan = make(chan *Tab, maxTabSize)
-	client.TabCallChan = make(chan TabCaller)
 	tabs, err := client.TabList("page")
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < maxTabSize-len(tabs); i++ {
+	n := maxTabSize - len(tabs)
+	if n < 0 {
+		for i := 0; i > n; i-- {
+			tab := tabs[0]
+			client.CloseTab(tab)
+			tabs = tabs[1:]
+		}
+	}
+	for i := 0; i < n; i++ {
 		tab, err := client.NewTab("")
 		if err != nil {
 			return nil, err
@@ -98,9 +108,30 @@ func Init(remoteUrl string, maxTabSize int) (*RemoteClient, error) {
 		tabs = append(tabs, tab)
 	}
 	client.Tabs = tabs
-	fmt.Println("tab length:", len(tabs))
-	go client.Run()
-	return &client, nil
+	for _, tab := range client.Tabs {
+		tab.BorwserClient = &client
+	}
+	err = tabInit(client.Tabs...)
+	if err == nil {
+		go client.Run()
+	}
+	return &client, err
+}
+
+// 初始化tab,建立ws侦听轮询
+func tabInit(tabs ...*Tab) error {
+	for _, tab := range tabs {
+		conn, _, err := websocket.DefaultDialer.Dial(tab.WebSocketDebuggerUrl, nil)
+		if err != nil {
+			return err
+		}
+		tab.lock = &sync.Mutex{}
+		tab.wsConn = conn
+		tab.responses = make(map[int]chan json.RawMessage)
+		tab.eventCallBacks = make(map[string]EventCallback)
+		go tab.WsLoop()
+	}
+	return nil
 }
 
 func (c *RemoteClient) Run() {
@@ -110,36 +141,18 @@ func (c *RemoteClient) Run() {
 			c.lock.Lock()
 			c.Tabs = append(c.Tabs, t)
 			c.lock.Unlock()
-		case caller := <-c.TabCallChan:
-			if len(c.Tabs) > 0 {
+
+		default:
+			if len(c.TabCallers) > 0 && len(c.Tabs) > 0 {
+				fmt.Printf("tabs: %d callers: %d", len(c.Tabs), len(c.TabCallers))
 				c.lock.Lock()
 				tab := c.Tabs[0]
 				c.Tabs = c.Tabs[1:]
-				c.lock.Unlock()
-
-				if tab.wsConn == nil {
-					err := tab.Init()
-					if err != nil {
-						c.Do(caller)
-						go c.Reset(tab)
-						continue
-					}
-				}
-				caller(tab)
-				// fmt.Printf("done callers:%d tabs:%d id:%s \r\n", len(c.TabCallers), len(c.Tabs), tab.ID)
-				c.TabChan <- tab
-			} else {
-				c.lock.Lock()
-				c.TabCallers = append(c.TabCallers, caller)
-				c.lock.Unlock()
-			}
-		default:
-			if len(c.TabCallers) > 0 {
-				c.lock.Lock()
 				caller := c.TabCallers[0]
 				c.TabCallers = c.TabCallers[1:]
-				c.Do(caller)
 				c.lock.Unlock()
+				caller(tab)
+				c.TabChan <- tab
 			}
 		}
 
@@ -158,15 +171,18 @@ func (c *RemoteClient) Reset(t *Tab) {
 
 // 添加一个执行任务
 func (c *RemoteClient) Do(caller TabCaller) {
-	c.TabCallChan <- caller
+	c.lock.Lock()
+	c.TabCallers = append(c.TabCallers, caller)
+	c.lock.Unlock()
 }
 
+// 创建标签
 func (c *RemoteClient) NewTab(url string) (*Tab, error) {
 	path := "/json/new"
 	if url != "" {
 		path += "?" + url
 	}
-	req, err := c.GetRequest("GET", path)
+	req, err := c.getRequest("GET", path)
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +199,13 @@ func (c *RemoteClient) NewTab(url string) (*Tab, error) {
 	return &tab, nil
 }
 
+// 关闭标签
 func (c *RemoteClient) CloseTab(t *Tab) error {
+	if t.wsConn != nil {
+		t.wsConn.Close()
+	}
 	path := "/json/close/" + t.ID
-	req, err := c.GetRequest("GET", path)
+	req, err := c.getRequest("GET", path)
 	if err != nil {
 		return err
 	}
@@ -196,8 +216,9 @@ func (c *RemoteClient) CloseTab(t *Tab) error {
 	return nil
 }
 
+// 标签列表
 func (c *RemoteClient) TabList(filter string) ([]*Tab, error) {
-	req, err := c.GetRequest("GET", "/json/list")
+	req, err := c.getRequest("GET", "/json/list")
 	if err != nil {
 		return nil, err
 	}
@@ -242,28 +263,16 @@ func unmarshal(payload []byte) (map[string]interface{}, error) {
 	return response, err
 }
 
-// 初始化tab,建立ws侦听轮询
-func (tab *Tab) Init() error {
-	conn, _, err := websocket.DefaultDialer.Dial(tab.WebSocketDebuggerUrl, nil)
-	if err != nil {
-		return err
-	}
-	tab.lock = &sync.Mutex{}
-	tab.wsConn = conn
-	tab.responses = make(map[int]chan json.RawMessage)
-	tab.callbacks = make(map[string]EventCallback)
-	go tab.WsLoop()
-	return nil
-}
-
+// tab ws轮询
 func (tab *Tab) WsLoop() {
 	for {
 		var message wsMessage
 		err := tab.wsConn.ReadJSON(&message)
 		if err != nil {
-			continue
+			tab.reset()
+			break
 		} else if message.Method != "" {
-			callback, ok := tab.callbacks[message.Method]
+			callback, ok := tab.eventCallBacks[message.Method]
 			if ok {
 				params, err := unmarshal(message.Params)
 				if err == nil {
@@ -277,6 +286,36 @@ func (tab *Tab) WsLoop() {
 			}
 		}
 	}
+}
+
+// 重置tab
+func (tab *Tab) reset() error {
+	path := "/json/new"
+	req, err := tab.BorwserClient.getRequest("GET", path)
+	if err != nil {
+		return err
+	}
+	resp, err := tab.BorwserClient.Client.Do(req)
+	if err != nil {
+		return ErrorOpenRemoteURL
+	}
+	if err = decode(resp, &tab); err != nil {
+		return err
+	}
+	//通知任务失败
+	tab.lock.Lock()
+	for _, ch := range tab.responses {
+		ch <- []byte(`{"error":"tab reset"}`)
+	}
+	for _, callback := range tab.eventCallBacks {
+		callback(Params{
+			"error": "tab reset",
+		})
+	}
+	tab.responses = nil
+	tab.eventCallBacks = nil
+	tab.lock.Unlock()
+	return tabInit(tab)
 }
 
 func GetWs(t *Tab) (*websocket.Conn, error) {
@@ -375,13 +414,13 @@ func (t *Tab) NetworkEvents(enable bool) error {
 
 func (t *Tab) CallbackEvent(method string, cb EventCallback) {
 	t.lock.Lock()
-	t.callbacks[method] = cb
+	t.eventCallBacks[method] = cb
 	t.lock.Unlock()
 }
 
 func (t *Tab) ClearCallbacks() {
 	t.lock.Lock()
-	t.callbacks = nil
+	t.eventCallBacks = nil
 	t.lock.Unlock()
 }
 
@@ -391,7 +430,14 @@ func (t *Tab) SendRequest(method string, params Params) (map[string]interface{},
 	if err != nil || rawReply == nil {
 		return nil, err
 	}
-	return unmarshal(rawReply)
+	res, err := unmarshal(rawReply)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := res["error"]; ok {
+		return nil, errors.New("tab reset")
+	}
+	return res, nil
 }
 
 // sendRawReplyRequest sends a request and returns the reply bytes.
@@ -451,7 +497,7 @@ func (t *Tab) WaitPageComplete(timeout time.Duration) bool {
 		for {
 			time.Sleep(1 * time.Second)
 			status, err := t.Evaluate("document.readyState")
-			if err == nil && status.(string) == "complete" {
+			if err == nil && (status.(string) == "complete" || status.(string) == "interactive") {
 				c <- true
 			}
 		}

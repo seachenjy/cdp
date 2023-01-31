@@ -1,13 +1,14 @@
 package cdp
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestError(t *testing.T) {
-	client, err := Init("http://localhost:9222", 5)
+	client, err := NewBrower("http://localhost:9222", 5)
 	if err != nil {
 		t.Error(err)
 	}
@@ -23,13 +24,23 @@ func TestError(t *testing.T) {
 	wait := &sync.WaitGroup{}
 	for _, url := range urls {
 		wait.Add(1)
+		fmt.Println("job start -> ", url)
 		go func(u string, w *sync.WaitGroup) {
 			client.Do(func(tab *Tab) {
-				tab.Navigate(u)
-				tab.WaitPageComplete(time.Second * 5)
+				err := tab.Navigate(u)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				ready := tab.WaitPageComplete(time.Second * 5)
+				if !ready {
+					t.Error("page load error")
+					return
+				}
 				title, err := tab.Evaluate("document.title")
 				if err != nil {
 					t.Error(err)
+					return
 				}
 				w.Done()
 				t.Log(title, u)
@@ -41,7 +52,7 @@ func TestError(t *testing.T) {
 }
 
 func TestResponseBody(t *testing.T) {
-	client, err := Init("http://localhost:9222", 1)
+	client, err := NewBrower("http://localhost:9222", 1)
 	if err != nil {
 		t.Error(err)
 	}
