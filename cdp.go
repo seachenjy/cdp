@@ -138,6 +138,12 @@ func (c *RemoteClient) Run() {
 	for {
 		select {
 		case t := <-c.TabChan:
+			//清理tab
+			t.lock.Lock()
+			t.eventCallBacks = nil
+			t.responses = nil
+			t.lock.Unlock()
+
 			c.lock.Lock()
 			c.Tabs = append(c.Tabs, t)
 			c.lock.Unlock()

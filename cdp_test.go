@@ -20,6 +20,7 @@ func TestError(t *testing.T) {
 		"http://www.weixin.com",
 		"http://www.163.com",
 		"http://www.taobao.com",
+		"http://www.4399.com",
 	}
 	wait := &sync.WaitGroup{}
 	for _, url := range urls {
